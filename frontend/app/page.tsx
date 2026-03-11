@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import { useDropzone } from "react-dropzone";
 import axios from "axios";
 import {
@@ -76,7 +76,21 @@ export default function DashboardPage() {
   const [result, setResult] = useState<CSVResult | null>(null);
   const [error, setError] = useState("");
   const [activeTab, setActiveTab] = useState<"line" | "bar" | "table">("line");
+  const [tablePage, setTablePage] = useState(1);
+  const [tableData, setTableData] = useState<Record<string, unknown>[]>([]);
+  const [isTableLoading, setIsTableLoading] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    if (activeTab === "table" && result?.upload_id) {
+      setIsTableLoading(true);
+      axios
+        .get(`${API}/csv/table/${result.upload_id}?page=${tablePage}&limit=100`)
+        .then((res) => setTableData(res.data.data))
+        .catch((err) => console.error("Failed to fetch table data", err))
+        .finally(() => setIsTableLoading(false));
+    }
+  }, [activeTab, tablePage, result?.upload_id]);
 
   // Drop zone
   const onDrop = useCallback(async (accepted: File[]) => {
@@ -87,6 +101,7 @@ export default function DashboardPage() {
     setError("");
     setResult(null);
     setProgress(0);
+    setTablePage(1);
 
     try {
       const fd = new FormData();
@@ -94,10 +109,19 @@ export default function DashboardPage() {
 
       const { data } = await axios.post(`${API}/csv/upload`, fd, {
         headers: { "Content-Type": "multipart/form-data" },
+        onUploadProgress: (progressEvent) => {
+          if (progressEvent.total) {
+            const percentCompleted = Math.round(
+              (progressEvent.loaded * 100) / progressEvent.total,
+            );
+            setProgress(percentCompleted);
+          }
+        },
       });
 
       const uploadId: string = data.upload_id;
       setStatus("processing");
+      setProgress(0); // Reset for processing phase
 
       // Poll status
       pollRef.current = setInterval(async () => {
@@ -150,9 +174,7 @@ export default function DashboardPage() {
           A
         </div>
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">
-            Insight AI
-          </h1>
+          <h1 className="text-2xl font-bold tracking-tight">Insight AI</h1>
           <p className="text-sm text-slate-400">
             Upload a CSV → instant chart visualisation
           </p>
@@ -190,12 +212,12 @@ export default function DashboardPage() {
           <div className="w-full bg-slate-800 rounded-full h-2">
             <div
               className="bg-brand-500 h-2 rounded-full transition-all duration-500"
-              style={{ width: `${status === "uploading" ? 10 : progress}%` }}
+              style={{ width: `${progress}%` }}
             />
           </div>
           <p className="text-xs text-slate-500">
             {status === "uploading"
-              ? "Uploading file"
+              ? `Uploading file (${progress}%)`
               : `${progress}% processed`}
           </p>
         </div>
@@ -218,7 +240,11 @@ export default function DashboardPage() {
               { label: "File", value: result.filename },
               {
                 label: "Processed",
-                value: new Date(result.processed_at).toLocaleTimeString(),
+                value: new Date(
+                  result.processed_at.endsWith("Z")
+                    ? result.processed_at
+                    : `${result.processed_at}Z`,
+                ).toLocaleString(),
               },
             ].map(({ label, value }) => (
               <div
@@ -309,48 +335,81 @@ export default function DashboardPage() {
 
           {/* Sample table */}
           {activeTab === "table" && (
-            <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-slate-800">
-                    {result.columns.map((c) => (
-                      <th
-                        key={c}
-                        className="px-4 py-3 text-left text-xs text-slate-400 font-medium whitespace-nowrap"
-                      >
-                        {c}
-                        <span className="ml-1 text-slate-600">
-                          ({result.dtypes[c]})
-                        </span>
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {result.sample_rows.map((row, i) => (
-                    <tr
-                      key={i}
-                      className="border-b border-slate-800/50 hover:bg-slate-800/40"
-                    >
-                      {result.columns.map((c) => (
-                        <td
-                          key={c}
-                          className="px-4 py-2 text-slate-300 whitespace-nowrap"
+            <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+              <div className="overflow-auto max-h-[600px]">
+                {isTableLoading ? (
+                  <div className="p-10 flex justify-center text-slate-400">
+                    Loading data...
+                  </div>
+                ) : (
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-slate-800 bg-slate-900 sticky top-0 z-10">
+                        {result.columns.map((c) => (
+                          <th
+                            key={c}
+                            className="px-4 py-3 text-left text-xs text-slate-400 font-medium whitespace-nowrap"
+                          >
+                            {c}
+                            <span className="ml-1 text-slate-600">
+                              ({result.dtypes[c]})
+                            </span>
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {tableData.map((row, i) => (
+                        <tr
+                          key={i}
+                          className="border-b border-slate-800/50 hover:bg-slate-800/40"
                         >
-                          {row[c] == null ? (
-                            <span className="text-slate-600 italic">null</span>
-                          ) : (
-                            String(row[c])
-                          )}
-                        </td>
+                          {result.columns.map((c) => (
+                            <td
+                              key={c}
+                              className="px-4 py-2 text-slate-300 whitespace-nowrap"
+                            >
+                              {row[c] == null ? (
+                                <span className="text-slate-600 italic">
+                                  null
+                                </span>
+                              ) : (
+                                String(row[c])
+                              )}
+                            </td>
+                          ))}
+                        </tr>
                       ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              <p className="text-xs text-slate-600 px-4 py-2">
-                Showing first 10 of {result.row_count.toLocaleString()} rows
-              </p>
+                    </tbody>
+                  </table>
+                )}
+              </div>
+              <div className="flex items-center justify-between border-t border-slate-800 px-4 py-3 bg-slate-900/50">
+                <p className="text-xs text-slate-400">
+                  Showing{" "}
+                  {(tablePage - 1) * 100 + (result.row_count > 0 ? 1 : 0)} to{" "}
+                  {Math.min(tablePage * 100, result.row_count)} of{" "}
+                  {result.row_count.toLocaleString()} rows
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    disabled={tablePage === 1 || isTableLoading}
+                    onClick={() => setTablePage((p) => p - 1)}
+                    className="px-3 py-1 bg-slate-800 text-slate-300 rounded hover:bg-slate-700 disabled:opacity-50 text-xs font-semibold"
+                  >
+                    Previous
+                  </button>
+                  <button
+                    disabled={
+                      tablePage * 100 >= result.row_count || isTableLoading
+                    }
+                    onClick={() => setTablePage((p) => p + 1)}
+                    className="px-3 py-1 bg-slate-800 text-slate-300 rounded hover:bg-slate-700 disabled:opacity-50 text-xs font-semibold"
+                  >
+                    Next
+                  </button>
+                </div>
+              </div>
             </div>
           )}
         </section>

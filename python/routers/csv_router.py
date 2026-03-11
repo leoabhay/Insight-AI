@@ -45,24 +45,36 @@ async def upload_csv(
     if not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only .csv files accepted")
 
-    content = await file.read()
-    if len(content) > MAX_BYTES:
+    upload_id = str(uuid.uuid4())
+    os.makedirs(settings.upload_dir, exist_ok=True)
+    dest = os.path.join(settings.upload_dir, f"{upload_id}.csv")
+
+    import shutil
+    import asyncio
+    
+    # Run the file copy in a background thread to prevent blocking
+    try:
+        def save_file():
+            with open(dest, "wb") as f:
+                shutil.copyfileobj(file.file, f)
+            return os.path.getsize(dest)
+            
+        size_bytes = await asyncio.to_thread(save_file)
+        if size_bytes > MAX_BYTES:
+            raise ValueError("File too large")
+    except ValueError:
+        if os.path.exists(dest):
+            os.remove(dest)
         raise HTTPException(
             status_code=413,
             detail=f"File too large. Max {settings.max_upload_mb} MB.",
         )
 
-    upload_id = str(uuid.uuid4())
-    dest = os.path.join(settings.upload_dir, f"{upload_id}.csv")
-
-    async with aiofiles.open(dest, "wb") as f:
-        await f.write(content)
-
     db = get_db()
     meta = {
         "upload_id": upload_id,
         "filename": file.filename,
-        "size_bytes": len(content),
+        "size_bytes": size_bytes,
         # "user_id": current_user["user_id"],  # enable with auth
         "status": "queued",
         "progress_pct": 0,
@@ -102,6 +114,35 @@ async def get_result(upload_id: str):
         raise HTTPException(status_code=202, detail=f"Processing status: {status}")
     return result
 
+@router.get("/table/{upload_id}")
+async def get_table_data(upload_id: str, page: int = 1, limit: int = 100):
+    dest = os.path.join(settings.upload_dir, f"{upload_id}.csv")
+    if not os.path.exists(dest):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    def _read_table():
+        skip = (page - 1) * limit
+        try:
+            if skip == 0:
+                df = pd.read_csv(dest, nrows=limit, low_memory=False)
+            else:
+                header = pd.read_csv(dest, nrows=0).columns.tolist()
+                df = pd.read_csv(dest, skiprows=skip + 1, nrows=limit, names=header, header=None, low_memory=False)
+                
+            for col in df.columns:
+                if df[col].dtype == "object" and ("date" in col.lower() or "time" in col.lower()):
+                    try:
+                        df[col] = pd.to_datetime(df[col], errors="coerce")
+                    except Exception:
+                        pass
+            res = df.where(pd.notnull(df), None).to_dict(orient="records")
+            return [{k: _safe(v) for k, v in row.items()} for row in res]
+        except pd.errors.EmptyDataError:
+            return []
+
+    data = await asyncio.to_thread(_read_table)
+    return {"data": data, "page": page, "limit": limit}
+
 # Delete
 @router.delete("/{upload_id}", status_code=204)
 async def delete_upload(upload_id: str):
@@ -134,30 +175,19 @@ async def _async_process(upload_id: str, filepath: str, filename: str):
     try:
         await _update("processing", 5)
 
-        # ── Phase 1: count rows & collect column info via chunked read ────────
-        # We run the chunked reading in a thread to avoid blocking
-        def _read_chunks():
-            total_rows = 0
-            chunks_data = []
-            reader = pd.read_csv(filepath, chunksize=CHUNK, low_memory=False)
-            for i, chunk in enumerate(reader):
-                # Coerce obvious date columns
-                for col in chunk.columns:
-                    if "date" in col.lower() or "time" in col.lower():
-                        try:
-                            chunk[col] = pd.to_datetime(chunk[col], errors="coerce")
-                        except Exception:
-                            pass
-                chunks_data.append(chunk)
-                total_rows += len(chunk)
-            return chunks_data, total_rows
+        # ── Read data direct and derive chart payload (in thread) ────────
+        def _compute_results():
+            df = pd.read_csv(filepath, low_memory=False)
+            rows = len(df)
 
-        chunks_data, total_rows = await asyncio.to_thread(_read_chunks)
-        await _update("processing", 50)
+            # Coerce obvious date columns
+            for col in df.columns:
+                if df[col].dtype == "object" and ("date" in col.lower() or "time" in col.lower()):
+                    try:
+                        df[col] = pd.to_datetime(df[col], errors="coerce")
+                    except Exception:
+                        pass
 
-        # ── Phase 2: concatenate and derive chart payload (in thread) ────────
-        def _compute_results(chunks, rows):
-            df: pd.DataFrame = pd.concat(chunks, ignore_index=True)
             col_names = list(df.columns)
             col_dtypes = {c: str(df[c].dtype) for c in df.columns}
 
@@ -216,10 +246,10 @@ async def _async_process(upload_id: str, filepath: str, filename: str):
                 "numeric_summary": numeric_summary,
                 "data_series": data_series,
                 "category_series": category_series,
-                "processed_at": datetime.utcnow().isoformat(),
+                "processed_at": datetime.utcnow().isoformat() + "Z",
             }
 
-        result_doc = await asyncio.to_thread(_compute_results, chunks_data, total_rows)
+        result_doc = await asyncio.to_thread(_compute_results)
 
         await db.processing_results.replace_one(
             {"upload_id": upload_id}, result_doc, upsert=True
